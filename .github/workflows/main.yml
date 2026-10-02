@@ -1,0 +1,680 @@
+name: Build Eden Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Android flavor"
+        required: true
+        default: mainline
+        type: choice
+        options:
+          - genshinSpoof
+          - mainline
+          - legacy
+
+      nightly:
+        description: "Nightly build"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-eden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Free up disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/* || true
+          sudo rm -rf /usr/local/lib/android/sdk/system-images/* || true
+          sudo apt-get clean
+
+      - name: Clone Eden at pinned commit
+        shell: bash
+        run: |
+          git clone https://github.com/eden-emulator/mirror.git Eden
+
+          cd Eden
+
+          git checkout 37fe9119526c03ca064166130cc983c55b9a9e86
+
+          git status --short --branch
+
+      - name: Patch Eden
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          ROOT = Path("Eden")
+
+          def fail(message):
+              print(f"PATCH FAILED - {message}")
+              sys.exit(1)
+
+
+          # ============================================================
+          # 1. PAUSE / RESUME FLOATING BUTTON
+          # ============================================================
+
+          path = ROOT / "src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt"
+
+          source = path.read_text()
+
+
+          # Add Pause/Resume fields
+          anchor = '    private val mainHandler = Handler(Looper.getMainLooper())\n'
+
+          fields = '''    private val pauseResumeButton: android.widget.Button by lazy {
+                  android.widget.Button(this)
+              }
+
+              private val pauseResumeRunnable = object : Runnable {
+                  override fun run() {
+                      updatePauseResumeButton()
+                      mainHandler.postDelayed(this, 150L)
+                  }
+              }
+
+          '''
+
+          if 'private val pauseResumeRunnable = object : Runnable' not in source:
+
+              if anchor not in source:
+                  fail("EmulationActivity mainHandler anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  anchor + fields,
+                  1
+              )
+
+
+          # Start Pause/Resume button after setContentView
+          anchor = '        setContentView(binding.root)\n'
+
+          if 'setupPauseResumeButton()' not in source:
+
+              if anchor not in source:
+                  fail("setContentView(binding.root) anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  anchor + '        setupPauseResumeButton()\n',
+                  1
+              )
+
+
+          # Stop polling when Activity is destroyed
+          anchor = '    override fun onDestroy() {\n'
+
+          if 'mainHandler.removeCallbacks(pauseResumeRunnable)' not in source:
+
+              if anchor not in source:
+                  fail("onDestroy anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  anchor + '        mainHandler.removeCallbacks(pauseResumeRunnable)\n',
+                  1
+              )
+
+
+          # Insert Pause/Resume helper functions
+          anchor = '    private fun enableFullscreenImmersive() {\n'
+
+          helper = '''    private fun setupPauseResumeButton() {
+                  val parent =
+                      findViewById<android.widget.FrameLayout>(android.R.id.content)
+
+                  pauseResumeButton.textSize = 18f
+                  pauseResumeButton.isAllCaps = false
+                  pauseResumeButton.text = "⏸"
+                  pauseResumeButton.alpha = 0.90f
+                  pauseResumeButton.elevation =
+                      20f * resources.displayMetrics.density
+
+                  pauseResumeButton.setOnClickListener {
+                      if (!org.yuzu.yuzu_emu.NativeLibrary.isRunning()) {
+                          return@setOnClickListener
+                      }
+
+                      if (org.yuzu.yuzu_emu.NativeLibrary.isPaused()) {
+                          org.yuzu.yuzu_emu.NativeLibrary.unpauseEmulation()
+                      } else {
+                          org.yuzu.yuzu_emu.NativeLibrary.pauseEmulation()
+                      }
+
+                      updatePauseResumeButton()
+                  }
+
+                  val density = resources.displayMetrics.density
+
+                  val width =
+                      (64f * density).toInt()
+
+                  val height =
+                      (48f * density).toInt()
+
+                  val topMargin =
+                      (80f * density).toInt()
+
+                  val endMargin =
+                      (16f * density).toInt()
+
+                  val params =
+                      android.widget.FrameLayout.LayoutParams(
+                          width,
+                          height
+                      )
+
+                  params.gravity =
+                      android.view.Gravity.TOP or
+                      android.view.Gravity.END
+
+                  params.topMargin = topMargin
+                  params.marginEnd = endMargin
+
+                  parent.addView(
+                      pauseResumeButton,
+                      params
+                  )
+
+                  pauseResumeButton.visibility =
+                      android.view.View.GONE
+
+                  mainHandler.post(
+                      pauseResumeRunnable
+                  )
+              }
+
+
+              private fun updatePauseResumeButton() {
+
+                  val running =
+                      runCatching {
+                          org.yuzu.yuzu_emu.NativeLibrary.isRunning()
+                      }.getOrDefault(false)
+
+                  pauseResumeButton.visibility =
+                      if (running) {
+                          android.view.View.VISIBLE
+                      } else {
+                          android.view.View.GONE
+                      }
+
+                  if (running) {
+
+                      pauseResumeButton.text =
+                          if (
+                              org.yuzu.yuzu_emu.NativeLibrary.isPaused()
+                          ) {
+                              "▶"
+                          } else {
+                              "⏸"
+                          }
+                  }
+              }
+
+          '''
+
+          if 'private fun setupPauseResumeButton()' not in source:
+
+              if anchor not in source:
+                  fail("enableFullscreenImmersive anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  helper + anchor,
+                  1
+              )
+
+
+          path.write_text(source)
+
+
+          # ============================================================
+          # 2. RIGHT TOUCH CAMERA
+          # ============================================================
+
+          path = ROOT / "src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt"
+
+          source = path.read_text()
+
+
+          # Camera state fields
+          anchor = '    private lateinit var windowInsets: WindowInsets\n'
+
+          camera_fields = '''    private var rightCameraPointerId = -1
+              private var rightCameraLastX = 0f
+              private var rightCameraLastY = 0f
+              private var rightCameraLastTime = 0L
+
+              private val rightCameraReferenceSpeed = 900f
+              private val rightCameraSensitivity = 1.0f
+
+          '''
+
+          if 'private var rightCameraPointerId = -1' not in source:
+
+              if anchor not in source:
+                  fail("InputOverlay windowInsets anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  camera_fields + anchor,
+                  1
+              )
+
+
+          # Camera touch handler
+          anchor = '    private fun playHaptics(event: MotionEvent) {\n'
+
+          camera_helper = '''    private fun handleRightCameraTouch(
+                  event: MotionEvent,
+                  playerIndex: Int
+              ): Boolean {
+
+                  val action = event.actionMasked
+
+
+                  // ------------------------------------------------------------
+                  // Finger DOWN
+                  // ------------------------------------------------------------
+
+                  if (action == MotionEvent.ACTION_DOWN) {
+
+                      val pointerIndex =
+                          event.actionIndex
+
+                      val pointerId =
+                          event.getPointerId(pointerIndex)
+
+                      val x =
+                          event.getX(pointerIndex)
+
+                      val y =
+                          event.getY(pointerIndex)
+
+
+                      // Normal overlay controls get priority.
+                      if (isTouchInputConsumed(pointerId)) {
+                          return false
+                      }
+
+
+                      // Right 45% of screen
+                      // AND bottom 55% of screen.
+                      if (x < width * 0.55f ||
+                          y < height * 0.45f
+                      ) {
+                          return false
+                      }
+
+
+                      rightCameraPointerId =
+                          pointerId
+
+                      rightCameraLastX =
+                          x
+
+                      rightCameraLastY =
+                          y
+
+                      rightCameraLastTime =
+                          event.eventTime
+
+
+                      NativeInput.onOverlayJoystickEvent(
+                          playerIndex,
+                          NativeAnalog.RStick,
+                          0f,
+                          0f
+                      )
+
+                      return true
+                  }
+
+
+                  // No active camera finger.
+                  if (rightCameraPointerId == -1) {
+                      return false
+                  }
+
+
+                  // Find the active camera pointer.
+                  var activeIndex = -1
+
+                  for (i in 0 until event.pointerCount) {
+
+                      if (
+                          event.getPointerId(i) ==
+                          rightCameraPointerId
+                      ) {
+                          activeIndex = i
+                          break
+                      }
+                  }
+
+
+                  if (activeIndex == -1) {
+                      return false
+                  }
+
+
+                  // ------------------------------------------------------------
+                  // Finger MOVE
+                  // ------------------------------------------------------------
+
+                  if (action == MotionEvent.ACTION_MOVE) {
+
+                      val x =
+                          event.getX(activeIndex)
+
+                      val y =
+                          event.getY(activeIndex)
+
+                      val now =
+                          event.eventTime
+
+
+                      val deltaMs =
+                          (now - rightCameraLastTime)
+                              .coerceAtLeast(1L)
+
+                      val deltaSeconds =
+                          deltaMs / 1000f
+
+
+                      val velocityX =
+                          (x - rightCameraLastX) /
+                          deltaSeconds
+
+                      val velocityY =
+                          (y - rightCameraLastY) /
+                          deltaSeconds
+
+
+                      // 900 px/s = full stick speed.
+                      val cameraX =
+                          (
+                              velocityX /
+                              rightCameraReferenceSpeed *
+                              rightCameraSensitivity
+                          ).coerceIn(-1f, 1f)
+
+
+                      val cameraY =
+                          (
+                              -velocityY /
+                              rightCameraReferenceSpeed *
+                              rightCameraSensitivity
+                          ).coerceIn(-1f, 1f)
+
+
+                      NativeInput.onOverlayJoystickEvent(
+                          playerIndex,
+                          NativeAnalog.RStick,
+                          cameraX,
+                          cameraY
+                      )
+
+
+                      rightCameraLastX =
+                          x
+
+                      rightCameraLastY =
+                          y
+
+                      rightCameraLastTime =
+                          now
+
+                      return true
+                  }
+
+
+                  // ------------------------------------------------------------
+                  // Finger UP / CANCEL
+                  // ------------------------------------------------------------
+
+                  if (
+                      action == MotionEvent.ACTION_UP ||
+                      action == MotionEvent.ACTION_POINTER_UP ||
+                      action == MotionEvent.ACTION_CANCEL
+                  ) {
+
+                      if (
+                          action == MotionEvent.ACTION_CANCEL ||
+                          event.getPointerId(event.actionIndex) ==
+                          rightCameraPointerId
+                      ) {
+
+                          NativeInput.onOverlayJoystickEvent(
+                              playerIndex,
+                              NativeAnalog.RStick,
+                              0f,
+                              0f
+                          )
+
+                          rightCameraPointerId =
+                              -1
+
+                          rightCameraLastTime =
+                              0L
+
+                          return true
+                      }
+                  }
+
+
+                  return false
+              }
+
+          '''
+
+          if 'private fun handleRightCameraTouch(' not in source:
+
+              if anchor not in source:
+                  fail("playHaptics anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  camera_helper + anchor,
+                  1
+              )
+
+
+          # Intercept camera BEFORE normal touchscreen input.
+          anchor = '''        if (shouldUpdateView) {
+                      invalidate()
+                  }
+
+          '''
+
+          camera_call = '''        if (shouldUpdateView) {
+                      invalidate()
+                  }
+
+                  // Right 45% x bottom 55% = custom camera.
+                  // Normal overlay controls have priority.
+                  if (handleRightCameraTouch(event, playerIndex)) {
+                      return true
+                  }
+
+          '''
+
+          if 'if (handleRightCameraTouch(event, playerIndex))' not in source:
+
+              if anchor not in source:
+                  fail("InputOverlay shouldUpdateView anchor not found")
+
+              source = source.replace(
+                  anchor,
+                  camera_call,
+                  1
+              )
+
+
+          # ------------------------------------------------------------
+          # Remove the normal visible R-stick joystick completely.
+          # ------------------------------------------------------------
+
+          old_rstick = '''                OverlayControl.STICK_R.id -> {
+                              overlayJoysticks.add(
+                                  initializeOverlayJoystick(
+                                      context,
+                                      windowSize,
+                                      R.drawable.joystick_range,
+                                      R.drawable.joystick,
+                                      R.drawable.joystick_depressed,
+                                      NativeAnalog.RStick,
+                                      NativeButton.RStick,
+                                      data,
+                                      position
+                                  )
+                              )
+                          }
+          '''
+
+          new_rstick = '''                OverlayControl.STICK_R.id -> {
+                              // Disabled.
+                              // Right side is now the custom touch camera.
+                          }
+          '''
+
+          if old_rstick not in source:
+              fail("R-stick overlay block not found")
+
+          source = source.replace(
+              old_rstick,
+              new_rstick,
+              1
+          )
+
+
+          path.write_text(source)
+
+
+          print("")
+          print("========================================")
+          print("PATCH SUCCESS")
+          print("========================================")
+          print("PAUSE / RESUME       : OK")
+          print("RIGHT TOUCH CAMERA   : OK")
+          print("R-STICK REMOVED      : OK")
+          print("L TOGGLE             : NOT INCLUDED")
+          print("========================================")
+          PY
+
+      - name: Verify patches
+        shell: bash
+        run: |
+          cd Eden
+
+          grep -q \
+            'private fun setupPauseResumeButton()' \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+
+          grep -q \
+            'private fun handleRightCameraTouch(' \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          grep -q \
+            'private var rightCameraPointerId = -1' \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          grep -q \
+            'if (handleRightCameraTouch(event, playerIndex))' \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          grep -q \
+            'Right side is now the custom touch camera.' \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          git diff --check
+
+          echo ""
+          echo "========================================"
+          echo "VERIFY OK"
+          echo "========================================"
+
+          git diff --stat
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.31.6"
+
+      - name: Install glslangValidator
+        shell: bash
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            glslang-tools
+
+          glslangValidator --version
+
+      - name: Gradle settings
+        shell: bash
+        run: |
+          cd Eden/src/android
+
+          chmod +x gradlew
+
+          ./gradlew --version
+
+      - name: Build optimized APK
+        shell: bash
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+          NIGHTLY: ${{ inputs.nightly }}
+        run: |
+          cd Eden/src/android
+
+          FLAVOR_CAP="$(printf '%s' "$FLAVOR" | sed 's/^./\u&/')"
+
+          NIGHTLY_FLG=""
+
+          if [ "$NIGHTLY" = "true" ]; then
+            NIGHTLY_FLG="-Pnightly=true"
+          fi
+
+          echo "========================================"
+          echo "Flavor : $FLAVOR_CAP"
+          echo "Nightly: $NIGHTLY"
+          echo "========================================"
+
+          ./gradlew \
+            --console=plain \
+            --stacktrace \
+            ":app:assemble${FLAVOR_CAP}Release" \
+            ${NIGHTLY_FLG}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-${{ inputs.flavor }}-android
+          path: Eden/src/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
